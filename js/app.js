@@ -2,7 +2,10 @@ const LOYER_DEFAUT = 250;
 const PURGE_DAYS = 2;
 const DB_STORE = "monsalon_db_v1";
 const DB_BACKUP_KEY = "monsalon_db_backup_v1";
+const DB_META_KEY = "monsalon_db_meta_v1";
 const IDB_NAME = "MonSalonDB";
+const FILE_POLL_MS = 8000;
+const DB_FILE_NAME = "monsalon.db";
 const LEGACY_KEYS = {
   clients:"ms_clients_data_v4",
   depenses:"ms_depenses_data_v4",
@@ -33,7 +36,9 @@ function formatHeureFR(heure){
   return `${h}h${min||"00"}`;
 }
 let db = null;
+let SQL = null;
 let dbReady = false;
+let fileServerMode = false;
 
 const state = {
   tab:"tableau-bord",
@@ -48,6 +53,7 @@ const state = {
   loyerDraft: String(LOYER_DEFAUT),
   dbSaved:true,
   persistError:"",
+  dbSource:"",
   calYear:new Date().getFullYear(),
   calMonth:new Date().getMonth(),
   showRdvModal:false,
@@ -65,13 +71,49 @@ function escapeHTML(v){return String(v??"").replace(/[&<>"']/g, c=>({"&":"&amp;"
 function parseMoney(v){return parseFloat(String(v||"").replace(",",".").replace(/[^0-9.]/g,""))||0}
 function notify(msg,ok=true){state.toast={msg,ok};render();setTimeout(()=>{state.toast=null;render()},3000)}
 
-/* ── Persistance locale : IndexedDB + secours localStorage ── */
-function appBasePath(){
-  const path=window.location.pathname.replace(/\/[^/]*$/,"");
-  return path.endsWith("/")?path:`${path}/`;
+/* ── Persistance : fichier monsalon.db + cache navigateur ── */
+function setLoadingMessage(msg){
+  const el=document.querySelector(".loading-screen .loading-msg");
+  if(el) el.textContent=msg;
 }
 function sqlAssetPath(file){
-  return `${appBasePath()}vendor/sql.js/${file}`;
+  return new URL(`vendor/sql.js/${file}`, window.location.href).href;
+}
+async function loadSqlJs(){
+  if(typeof initSqlJs!=="function"){
+    throw new Error("sql.js n'a pas été chargé. Ouvrez le site via un serveur web (pas en double-cliquant index.html).");
+  }
+  const sources=[
+    sqlAssetPath,
+    file=>`https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${file}`
+  ];
+  let lastError=null;
+  for(const locateFile of sources){
+    try{
+      return await Promise.race([
+        initSqlJs({locateFile}),
+        new Promise((_,reject)=>setTimeout(()=>reject(new Error("Délai dépassé au chargement de sql.js")),20000))
+      ]);
+    }catch(e){
+      lastError=e;
+      console.warn("Tentative sql.js échouée", e);
+    }
+  }
+  throw lastError||new Error("Impossible de charger sql.js");
+}
+function readLocalMeta(){
+  try{
+    return JSON.parse(localStorage.getItem(DB_META_KEY)||"null");
+  }catch(e){
+    return null;
+  }
+}
+function writeLocalMeta(meta){
+  try{
+    localStorage.setItem(DB_META_KEY, JSON.stringify(meta));
+  }catch(e){
+    console.warn("Impossible d'écrire les métadonnées locales", e);
+  }
 }
 function normalizeDbBytes(saved){
   if(!saved) return null;
@@ -146,7 +188,36 @@ async function idbSet(key,val){
     tx.onerror=()=>reject(tx.error);
   });
 }
-async function loadSavedDatabase(){
+async function probeFileServer(){
+  try{
+    const res=await fetch("/api/db",{method:"GET"});
+    if(res.status===204||res.ok){
+      fileServerMode=true;
+      return true;
+    }
+  }catch(e){
+    fileServerMode=false;
+  }
+  return false;
+}
+async function loadFileServerDatabase(){
+  const res=await fetch("/api/db");
+  if(res.status===204) return {bytes:null, updatedAt:null};
+  if(!res.ok) throw new Error(`Lecture ${DB_FILE_NAME} échouée (${res.status})`);
+  const bytes=normalizeDbBytes(await res.arrayBuffer());
+  return {bytes, updatedAt:res.headers.get("X-Db-Updated")};
+}
+async function saveFileServerDatabase(bytes){
+  const res=await fetch("/api/db",{
+    method:"PUT",
+    headers:{"Content-Type":"application/octet-stream"},
+    body:bytes
+  });
+  if(!res.ok) throw new Error(`Écriture ${DB_FILE_NAME} échouée (${res.status})`);
+  const json=await res.json();
+  return json.updated_at||new Date().toISOString();
+}
+async function loadLocalDatabase(){
   let saved=null;
   let source="new";
   if(idbSupported()){
@@ -161,7 +232,29 @@ async function loadSavedDatabase(){
     saved=readLocalBackup();
     if(saved) source="localstorage";
   }
-  return {saved, source};
+  return {saved, source, updatedAt:readLocalMeta()?.updated_at||null};
+}
+async function loadSavedDatabase(){
+  if(await probeFileServer()){
+    setLoadingMessage(`Chargement de ${DB_FILE_NAME}…`);
+    try{
+      const remote=await loadFileServerDatabase();
+      if(remote.bytes){
+        return {saved:remote.bytes, source:"file", updatedAt:remote.updatedAt};
+      }
+      return {saved:null, source:"new", updatedAt:null};
+    }catch(e){
+      console.warn("Fichier serveur indisponible, repli navigateur", e);
+      fileServerMode=false;
+    }
+  }
+
+  setLoadingMessage("Chargement des données locales…");
+  const local=await loadLocalDatabase();
+  if(local.saved){
+    return {saved:local.saved, source:local.source, updatedAt:local.updatedAt};
+  }
+  return {saved:null, source:"new", updatedAt:null};
 }
 async function requestPersistentStorage(){
   try{
@@ -217,9 +310,20 @@ function dbScalar(sql,params=[]){
 async function persistDb(){
   if(!db) return;
   const data=db.export();
+  let updatedAt=new Date().toISOString();
   state.dbSaved=false;
   state.persistError="";
   let saved=false;
+
+  if(fileServerMode){
+    try{
+      updatedAt=await saveFileServerDatabase(data);
+      saved=true;
+    }catch(e){
+      console.warn("Écriture fichier serveur échouée", e);
+      state.persistError=`Impossible d'écrire ${DB_FILE_NAME} sur le serveur.`;
+    }
+  }
 
   if(idbSupported()){
     try{
@@ -230,17 +334,82 @@ async function persistDb(){
     }
   }
 
-  const backupOk=writeLocalBackup(data);
-  if(backupOk) saved=true;
+  if(writeLocalBackup(data)) saved=true;
+  writeLocalMeta({updated_at:updatedAt});
 
   if(!saved){
     state.dbSaved=false;
-    state.persistError="Impossible de sauvegarder les données sur cet appareil.";
+    state.persistError="Impossible de sauvegarder les données.";
     throw new Error(state.persistError);
   }
 
   state.dbSaved=true;
   state.persistError="";
+}
+async function reloadDatabase(bytes, source, updatedAt){
+  if(db) try{db.close()}catch(e){}
+  db=new SQL.Database(bytes);
+  state.dbSource=source;
+  if(updatedAt) writeLocalMeta({updated_at:updatedAt});
+  await syncStateFromDb();
+}
+async function pullFileServerIfNewer(){
+  if(!dbReady||!fileServerMode) return;
+  try{
+    const remote=await loadFileServerDatabase();
+    if(!remote.bytes) return;
+    const remoteTime=Date.parse(remote.updatedAt||0);
+    const localTime=Date.parse(readLocalMeta()?.updated_at||0);
+    if(!remoteTime||remoteTime<=localTime) return;
+    await reloadDatabase(remote.bytes,"file",remote.updatedAt);
+    writeLocalBackup(remote.bytes);
+    if(idbSupported()) await idbSet(DB_STORE, remote.bytes).catch(()=>{});
+    render();
+  }catch(e){
+    console.warn("Synchronisation fichier échouée", e);
+  }
+}
+function downloadSqliteFile(){
+  if(!db) return;
+  const bytes=db.export();
+  const blob=new Blob([bytes],{type:"application/octet-stream"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download=DB_FILE_NAME;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  notify(`${DB_FILE_NAME} téléchargé.`);
+}
+function triggerImportDb(){
+  document.getElementById("db-import-input")?.click();
+}
+async function importDbFromInput(input){
+  const file=input?.files?.[0];
+  if(!file||!SQL) return;
+  input.value="";
+  try{
+    const bytes=normalizeDbBytes(await file.arrayBuffer());
+    if(!bytes?.length) throw new Error("Fichier vide");
+    if(db) try{db.close()}catch(e){}
+    db=new SQL.Database(bytes);
+    state.dbSource="import";
+    ensureClientColumns();
+    ensureRdvTelephoneColumn();
+    ensureSoftDeleteColumns();
+    await persistDb();
+    await syncStateFromDb();
+    notify(`Base importée : ${file.name}`);
+    render();
+  }catch(e){
+    console.error(e);
+    notify("Fichier SQLite invalide.", false);
+  }
+}
+function dbStatusLabel(){
+  if(state.persistError) return `⚠️ ${state.persistError}`;
+  if(fileServerMode) return `💾 Fichier partagé : data/${DB_FILE_NAME}`;
+  if(state.dbSaved) return "💾 Sauvegardé dans ce navigateur";
+  return "⏳ Sauvegarde…";
 }
 function ensureClientColumns(){
   try{
@@ -345,15 +514,14 @@ function purgeOldRdvs(){
   });
 }
 async function initDb(){
-  document.getElementById("root").innerHTML=`<div class="loading-screen"><img src="assets/logo.png?v=6" alt="Leycia beauty" style="max-width:200px;width:80%;height:auto;object-fit:contain"><div>Chargement de la base de données…</div></div>`;
+  document.getElementById("root").innerHTML=`<div class="loading-screen"><img src="assets/logo.png?v=6" alt="Leycia beauty" style="max-width:200px;width:80%;height:auto;object-fit:contain"><div class="loading-msg">Chargement de la base de données…</div></div>`;
   await requestPersistentStorage();
-  const SQL=await initSqlJs({locateFile:sqlAssetPath});
+  setLoadingMessage("Chargement du moteur SQLite…");
+  SQL=await loadSqlJs();
   const {saved, source}=await loadSavedDatabase();
   db=saved?new SQL.Database(saved):new SQL.Database();
+  state.dbSource=source;
   if(!saved) createSchema();
-  else if(source==="localstorage"){
-    console.info("Base restaurée depuis la sauvegarde localStorage");
-  }
   ensureClientColumns();
   ensureRdvTelephoneColumn();
   ensureSoftDeleteColumns();
@@ -361,6 +529,7 @@ async function initDb(){
   await persistDb();
   await syncStateFromDb();
   dbReady=true;
+  if(fileServerMode) setInterval(pullFileServerIfNewer, FILE_POLL_MS);
   render();
 }
 async function save(){await syncStateFromDb()}
@@ -525,6 +694,7 @@ function exportWord(){
 function render(){
   if(!dbReady) return;
   document.getElementById("root").innerHTML=`
+    <input type="file" id="db-import-input" accept=".db,.sqlite,application/octet-stream" style="display:none" onchange="importDbFromInput(this)">
     ${state.toast?`<div class="toast ${state.toast.ok?"":"error"}">${escapeHTML(state.toast.msg)}</div>`:""}
     <div class="mobile-bar"><div class="mobile-brand"><img src="assets/logo.png?v=6" alt="Leycia beauty"><span class="mobile-brand-name">Mon activité</span></div><button class="menu-btn" onclick="state.menu=!state.menu;render()">${state.menu?"×":"☰"}</button></div>
     <div class="overlay ${state.menu?"show":""}" onclick="state.menu=false;render()"></div>
@@ -533,7 +703,15 @@ function render(){
       <aside class="sidebar ${state.menu?"open":""}">
         <div class="brand"><div class="brand-logo-wrap"><img class="brand-logo" src="assets/logo.png?v=6" alt="Leycia beauty"></div><span class="brand-tagline">Mon activité</span></div>
         <nav class="nav">${navHTML()}</nav>
-        <div class="sidebar-footer">🏠 Frais de chaise fixes :<br><b>${FORMAT_CAD_EXPENSE(CalcPlatform.getLoyer())} / mois</b><br><span class="sidebar-note">${state.persistError?`⚠️ ${escapeHTML(state.persistError)}`:state.dbSaved?"💾 Données sauvegardées sur cet appareil":"⏳ Sauvegarde en cours…"}</span></div>
+        <div class="sidebar-db">
+          <div class="sidebar-db-title">Base ${DB_FILE_NAME}</div>
+          <div class="sidebar-db-actions">
+            <button class="btn secondary btn-compact" onclick="downloadSqliteFile()">Exporter</button>
+            <button class="btn secondary btn-compact" onclick="triggerImportDb()">Importer</button>
+          </div>
+          <span class="sidebar-note">${escapeHTML(dbStatusLabel())}</span>
+        </div>
+        <div class="sidebar-footer">🏠 Frais de chaise fixes :<br><b>${FORMAT_CAD_EXPENSE(CalcPlatform.getLoyer())} / mois</b></div>
       </aside>
       <main>${page()}</main>
     </div>
@@ -801,11 +979,16 @@ function rapportPage(){
         ${kpi("Bénéfice net",FORMAT_CAD(data.totalProfit),data.totalProfit>=0?"var(--success)":"var(--danger)","Revenus - dépenses - loyer")}
       </div>
     </div>
-    <div style="margin-top:18px"><button class="btn dark" onclick="exportWord()">⬇ Générer et télécharger le fichier Word (.doc)</button></div>
+    <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn dark" onclick="exportWord()">⬇ Rapport Word (.doc)</button>
+      <button class="btn secondary" onclick="downloadSqliteFile()">⬇ ${DB_FILE_NAME}</button>
+      <button class="btn secondary" onclick="triggerImportDb()">⬆ Importer ${DB_FILE_NAME}</button>
+    </div>
+    <p class="subtitle" style="margin-top:14px">Pour partager entre Chrome, Edge ou un autre appareil : exportez <b>${DB_FILE_NAME}</b>, puis importez-le sur l'autre navigateur. Avec <b>npm start</b>, le fichier <b>data/${DB_FILE_NAME}</b> est partagé automatiquement.</p>
   </div>`;
 }
 
-window.state=state; window.render=render; window.setTab=setTab; window.updateForm=updateForm; window.updateFormAndRender=updateFormAndRender; window.openRdvModal=openRdvModal; window.closeModal=closeModal; window.addClient=addClient; window.addDepense=addDepense; window.addRdv=addRdv; window.terminerRdv=terminerRdv; window.encaisserRdv=encaisserRdv; window.deleteRdv=deleteRdv; window.dismissCompletedRdv=dismissCompletedRdv; window.deleteClient=deleteClient; window.deleteDepense=deleteDepense; window.changeMonth=changeMonth; window.selectDateFromCalendar=selectDateFromCalendar; window.exportWord=exportWord; window.updateRent=updateRent;
+window.state=state; window.render=render; window.setTab=setTab; window.updateForm=updateForm; window.updateFormAndRender=updateFormAndRender; window.openRdvModal=openRdvModal; window.closeModal=closeModal; window.addClient=addClient; window.addDepense=addDepense; window.addRdv=addRdv; window.terminerRdv=terminerRdv; window.encaisserRdv=encaisserRdv; window.deleteRdv=deleteRdv; window.dismissCompletedRdv=dismissCompletedRdv; window.deleteClient=deleteClient; window.deleteDepense=deleteDepense; window.changeMonth=changeMonth; window.selectDateFromCalendar=selectDateFromCalendar; window.exportWord=exportWord; window.updateRent=updateRent; window.downloadSqliteFile=downloadSqliteFile; window.triggerImportDb=triggerImportDb; window.importDbFromInput=importDbFromInput;
 window.addEventListener("beforeunload",()=>{
   if(db){
     try{writeLocalBackup(db.export())}catch(e){}
@@ -817,5 +1000,6 @@ document.addEventListener("visibilitychange",()=>{
 
 initDb().catch(e=>{
   console.error(e);
-  document.getElementById("root").innerHTML=`<div class="loading-screen"><div style="color:var(--danger)">Impossible de charger la base de données.</div><div style="font-size:13px;font-weight:500">Rechargez la page. Si le problème continue, vérifiez que les fichiers vendor/sql.js sont bien en ligne.</div></div>`;
+  const localFile=window.location.protocol==="file:";
+  document.getElementById("root").innerHTML=`<div class="loading-screen"><div style="color:var(--danger);font-weight:800;margin-bottom:10px">Impossible de charger la base de données.</div><div style="font-size:13px;font-weight:500;max-width:460px;text-align:center;line-height:1.55">${localFile?"N'ouvrez pas index.html en double-clic. Dans le dossier du projet : <code>npm install</code> puis <code>npm start</code>":"Vérifiez que vendor/sql.js/sql-wasm.wasm est bien en ligne."}<br><br>${escapeHTML(e.message||String(e))}</div></div>`;
 });
