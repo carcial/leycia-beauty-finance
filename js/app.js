@@ -1,6 +1,8 @@
 const LOYER_DEFAUT = 250;
 const PURGE_DAYS = 2;
 const DB_STORE = "monsalon_db_v1";
+const DB_BACKUP_KEY = "monsalon_db_backup_v1";
+const IDB_NAME = "MonSalonDB";
 const LEGACY_KEYS = {
   clients:"ms_clients_data_v4",
   depenses:"ms_depenses_data_v4",
@@ -45,6 +47,7 @@ const state = {
   loyer: LOYER_DEFAUT,
   loyerDraft: String(LOYER_DEFAUT),
   dbSaved:true,
+  persistError:"",
   calYear:new Date().getFullYear(),
   calMonth:new Date().getMonth(),
   showRdvModal:false,
@@ -62,11 +65,65 @@ function escapeHTML(v){return String(v??"").replace(/[&<>"']/g, c=>({"&":"&amp;"
 function parseMoney(v){return parseFloat(String(v||"").replace(",",".").replace(/[^0-9.]/g,""))||0}
 function notify(msg,ok=true){state.toast={msg,ok};render();setTimeout(()=>{state.toast=null;render()},3000)}
 
-/* ── IndexedDB : persistance du fichier SQLite ── */
+/* ── Persistance locale : IndexedDB + secours localStorage ── */
+function appBasePath(){
+  const path=window.location.pathname.replace(/\/[^/]*$/,"");
+  return path.endsWith("/")?path:`${path}/`;
+}
+function sqlAssetPath(file){
+  return `${appBasePath()}vendor/sql.js/${file}`;
+}
+function normalizeDbBytes(saved){
+  if(!saved) return null;
+  if(saved instanceof Uint8Array) return saved;
+  if(saved instanceof ArrayBuffer) return new Uint8Array(saved);
+  if(ArrayBuffer.isView(saved)) return new Uint8Array(saved.buffer, saved.byteOffset, saved.byteLength);
+  if(Array.isArray(saved)) return Uint8Array.from(saved);
+  return null;
+}
+function bytesToBase64(bytes){
+  let binary="";
+  const chunk=0x8000;
+  for(let i=0;i<bytes.length;i+=chunk){
+    binary+=String.fromCharCode.apply(null, bytes.subarray(i, i+chunk));
+  }
+  return btoa(binary);
+}
+function base64ToBytes(b64){
+  const binary=atob(b64);
+  const bytes=new Uint8Array(binary.length);
+  for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+  return bytes;
+}
+function readLocalBackup(){
+  try{
+    const b64=localStorage.getItem(DB_BACKUP_KEY);
+    return b64?normalizeDbBytes(base64ToBytes(b64)):null;
+  }catch(e){
+    console.warn("Lecture backup localStorage impossible", e);
+    return null;
+  }
+}
+function writeLocalBackup(bytes){
+  try{
+    localStorage.setItem(DB_BACKUP_KEY, bytesToBase64(bytes));
+    return true;
+  }catch(e){
+    console.warn("Écriture backup localStorage impossible", e);
+    return false;
+  }
+}
+function idbSupported(){
+  return typeof indexedDB!=="undefined";
+}
 function idbOpen(){
   return new Promise((resolve,reject)=>{
-    const req=indexedDB.open("MonSalonDB",1);
-    req.onupgradeneeded=()=>req.result.createObjectStore("files");
+    if(!idbSupported()){reject(new Error("IndexedDB indisponible"));return}
+    const req=indexedDB.open(IDB_NAME,1);
+    req.onupgradeneeded=()=>{
+      const db=req.result;
+      if(!db.objectStoreNames.contains("files")) db.createObjectStore("files");
+    };
     req.onsuccess=()=>resolve(req.result);
     req.onerror=()=>reject(req.error);
   });
@@ -76,7 +133,7 @@ async function idbGet(key){
   return new Promise((resolve,reject)=>{
     const tx=idb.transaction("files","readonly");
     const req=tx.objectStore("files").get(key);
-    req.onsuccess=()=>resolve(req.result||null);
+    req.onsuccess=()=>resolve(normalizeDbBytes(req.result));
     req.onerror=()=>reject(req.error);
   });
 }
@@ -89,6 +146,32 @@ async function idbSet(key,val){
     tx.onerror=()=>reject(tx.error);
   });
 }
+async function loadSavedDatabase(){
+  let saved=null;
+  let source="new";
+  if(idbSupported()){
+    try{
+      saved=await idbGet(DB_STORE);
+      if(saved) source="indexeddb";
+    }catch(e){
+      console.warn("IndexedDB lecture échouée, tentative backup localStorage", e);
+    }
+  }
+  if(!saved){
+    saved=readLocalBackup();
+    if(saved) source="localstorage";
+  }
+  return {saved, source};
+}
+async function requestPersistentStorage(){
+  try{
+    if(navigator.storage&&navigator.storage.persist){
+      await navigator.storage.persist();
+    }
+  }catch(e){
+    console.warn("Demande de stockage persistant ignorée", e);
+  }
+}
 
 /* ── SQLite (sql.js) + IndexedDB — persistance locale, compatible GitHub Pages ── */
 let persistChain = Promise.resolve();
@@ -99,7 +182,12 @@ function dbExec(sql,params=[]){
 function queuePersist(){
   persistChain = persistChain
     .then(() => persistDb())
-    .catch(e => console.error("Échec de sauvegarde locale", e));
+    .catch(e => {
+      console.error("Échec de sauvegarde locale", e);
+      state.dbSaved=false;
+      state.persistError="Les données n'ont pas pu être sauvegardées sur cet appareil.";
+      render();
+    });
   return persistChain;
 }
 async function dbRun(sql,params=[]){
@@ -129,8 +217,30 @@ function dbScalar(sql,params=[]){
 async function persistDb(){
   if(!db) return;
   const data=db.export();
-  await idbSet(DB_STORE,data);
+  state.dbSaved=false;
+  state.persistError="";
+  let saved=false;
+
+  if(idbSupported()){
+    try{
+      await idbSet(DB_STORE,data);
+      saved=true;
+    }catch(e){
+      console.warn("IndexedDB écriture échouée", e);
+    }
+  }
+
+  const backupOk=writeLocalBackup(data);
+  if(backupOk) saved=true;
+
+  if(!saved){
+    state.dbSaved=false;
+    state.persistError="Impossible de sauvegarder les données sur cet appareil.";
+    throw new Error(state.persistError);
+  }
+
   state.dbSaved=true;
+  state.persistError="";
 }
 function ensureClientColumns(){
   try{
@@ -236,10 +346,14 @@ function purgeOldRdvs(){
 }
 async function initDb(){
   document.getElementById("root").innerHTML=`<div class="loading-screen"><img src="assets/logo.png?v=6" alt="Leycia beauty" style="max-width:200px;width:80%;height:auto;object-fit:contain"><div>Chargement de la base de données…</div></div>`;
-  const SQL=await initSqlJs({locateFile:f=>`https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${f}`});
-  const saved=await idbGet(DB_STORE);
+  await requestPersistentStorage();
+  const SQL=await initSqlJs({locateFile:sqlAssetPath});
+  const {saved, source}=await loadSavedDatabase();
   db=saved?new SQL.Database(saved):new SQL.Database();
   if(!saved) createSchema();
+  else if(source==="localstorage"){
+    console.info("Base restaurée depuis la sauvegarde localStorage");
+  }
   ensureClientColumns();
   ensureRdvTelephoneColumn();
   ensureSoftDeleteColumns();
@@ -419,7 +533,7 @@ function render(){
       <aside class="sidebar ${state.menu?"open":""}">
         <div class="brand"><div class="brand-logo-wrap"><img class="brand-logo" src="assets/logo.png?v=6" alt="Leycia beauty"></div><span class="brand-tagline">Mon activité</span></div>
         <nav class="nav">${navHTML()}</nav>
-        <div class="sidebar-footer">🏠 Frais de chaise fixes :<br><b>${FORMAT_CAD_EXPENSE(CalcPlatform.getLoyer())} / mois</b><br><span class="sidebar-note">${state.dbSaved?"💾 Données sauvegardées localement (SQLite)":"⏳ Sauvegarde en cours…"}</span></div>
+        <div class="sidebar-footer">🏠 Frais de chaise fixes :<br><b>${FORMAT_CAD_EXPENSE(CalcPlatform.getLoyer())} / mois</b><br><span class="sidebar-note">${state.persistError?`⚠️ ${escapeHTML(state.persistError)}`:state.dbSaved?"💾 Données sauvegardées sur cet appareil":"⏳ Sauvegarde en cours…"}</span></div>
       </aside>
       <main>${page()}</main>
     </div>
@@ -692,7 +806,16 @@ function rapportPage(){
 }
 
 window.state=state; window.render=render; window.setTab=setTab; window.updateForm=updateForm; window.updateFormAndRender=updateFormAndRender; window.openRdvModal=openRdvModal; window.closeModal=closeModal; window.addClient=addClient; window.addDepense=addDepense; window.addRdv=addRdv; window.terminerRdv=terminerRdv; window.encaisserRdv=encaisserRdv; window.deleteRdv=deleteRdv; window.dismissCompletedRdv=dismissCompletedRdv; window.deleteClient=deleteClient; window.deleteDepense=deleteDepense; window.changeMonth=changeMonth; window.selectDateFromCalendar=selectDateFromCalendar; window.exportWord=exportWord; window.updateRent=updateRent;
+window.addEventListener("beforeunload",()=>{
+  if(db){
+    try{writeLocalBackup(db.export())}catch(e){}
+  }
+});
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState==="hidden"&&db) queuePersist();
+});
+
 initDb().catch(e=>{
   console.error(e);
-  document.getElementById("root").innerHTML=`<div class="loading-screen"><div style="color:var(--danger)">Impossible de charger la base de données.</div><div style="font-size:13px;font-weight:500">Rechargez la page ou vérifiez votre connexion (sql.js CDN).</div></div>`;
+  document.getElementById("root").innerHTML=`<div class="loading-screen"><div style="color:var(--danger)">Impossible de charger la base de données.</div><div style="font-size:13px;font-weight:500">Rechargez la page. Si le problème continue, vérifiez que les fichiers vendor/sql.js sont bien en ligne.</div></div>`;
 });
