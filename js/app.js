@@ -39,6 +39,8 @@ let db = null;
 let SQL = null;
 let dbReady = false;
 let fileServerMode = false;
+let dbApiUrl = null;
+const DB_API_CANDIDATES = ["/api/db", "/api/db.php"];
 
 const state = {
   tab:"tableau-bord",
@@ -189,26 +191,33 @@ async function idbSet(key,val){
   });
 }
 async function probeFileServer(){
-  try{
-    const res=await fetch("/api/db",{method:"GET"});
-    if(res.status===204||res.ok){
-      fileServerMode=true;
-      return true;
+  for(const url of DB_API_CANDIDATES){
+    try{
+      const res=await fetch(url,{method:"GET"});
+      if(res.status===204||res.ok){
+        fileServerMode=true;
+        dbApiUrl=url;
+        return true;
+      }
+    }catch(e){
+      console.warn(`API indisponible: ${url}`, e);
     }
-  }catch(e){
-    fileServerMode=false;
   }
+  fileServerMode=false;
+  dbApiUrl=null;
   return false;
 }
 async function loadFileServerDatabase(){
-  const res=await fetch("/api/db");
+  if(!dbApiUrl) throw new Error("API base de données introuvable");
+  const res=await fetch(dbApiUrl);
   if(res.status===204) return {bytes:null, updatedAt:null};
   if(!res.ok) throw new Error(`Lecture ${DB_FILE_NAME} échouée (${res.status})`);
   const bytes=normalizeDbBytes(await res.arrayBuffer());
   return {bytes, updatedAt:res.headers.get("X-Db-Updated")};
 }
 async function saveFileServerDatabase(bytes){
-  const res=await fetch("/api/db",{
+  if(!dbApiUrl) throw new Error("API base de données introuvable");
+  const res=await fetch(dbApiUrl,{
     method:"PUT",
     headers:{"Content-Type":"application/octet-stream"},
     body:bytes
@@ -313,18 +322,18 @@ async function persistDb(){
   let updatedAt=new Date().toISOString();
   state.dbSaved=false;
   state.persistError="";
-  let saved=false;
 
   if(fileServerMode){
-    try{
-      updatedAt=await saveFileServerDatabase(data);
-      saved=true;
-    }catch(e){
-      console.warn("Écriture fichier serveur échouée", e);
-      state.persistError=`Impossible d'écrire ${DB_FILE_NAME} sur le serveur.`;
-    }
+    updatedAt=await saveFileServerDatabase(data);
+    writeLocalMeta({updated_at:updatedAt});
+    if(idbSupported()) await idbSet(DB_STORE,data).catch(()=>{});
+    writeLocalBackup(data);
+    state.dbSaved=true;
+    state.persistError="";
+    return;
   }
 
+  let saved=false;
   if(idbSupported()){
     try{
       await idbSet(DB_STORE,data);
@@ -333,13 +342,11 @@ async function persistDb(){
       console.warn("IndexedDB écriture échouée", e);
     }
   }
-
   if(writeLocalBackup(data)) saved=true;
   writeLocalMeta({updated_at:updatedAt});
 
   if(!saved){
-    state.dbSaved=false;
-    state.persistError="Impossible de sauvegarder les données.";
+    state.persistError="Lancez npm start pour utiliser data/monsalon.db (comme PHP).";
     throw new Error(state.persistError);
   }
 
@@ -407,9 +414,8 @@ async function importDbFromInput(input){
 }
 function dbStatusLabel(){
   if(state.persistError) return `⚠️ ${state.persistError}`;
-  if(fileServerMode) return `💾 Fichier partagé : data/${DB_FILE_NAME}`;
-  if(state.dbSaved) return "💾 Sauvegardé dans ce navigateur";
-  return "⏳ Sauvegarde…";
+  if(fileServerMode) return `💾 Source unique : data/${DB_FILE_NAME} (clients, dépenses, RDV, loyer)`;
+  return "⚠️ Mode navigateur — lancez npm start ou hébergez avec PHP pour data/monsalon.db";
 }
 function ensureClientColumns(){
   try{
@@ -656,7 +662,21 @@ function dateParts(date){const [y,m,d]=date.split("-");return {y:Number(y),m:Num
 function changeMonth(delta){state.selectedDate=null;let m=state.calMonth+delta;if(m<0){m=11;state.calYear--}if(m>11){m=0;state.calYear++}state.calMonth=m;render()}
 function selectDateFromCalendar(date){state.selectedDate=state.selectedDate===date?null:date;render()}
 
+function refreshCalcFromDb(){
+  state.clients=dbAll("SELECT * FROM clients ORDER BY id DESC");
+  state.depenses=dbAll("SELECT * FROM depenses ORDER BY id DESC");
+  state.rdvs=dbAll("SELECT * FROM rdvs ORDER BY date ASC, heure ASC");
+  const loyerVal=parseMoney(dbScalar("SELECT value FROM settings WHERE key='loyer'")||LOYER_DEFAUT);
+  state.loyer=loyerVal>0?loyerVal:LOYER_DEFAUT;
+  state.calc=CalcPlatform.sync({
+    clients:state.clients,
+    depenses:state.depenses,
+    rdvs:state.rdvs,
+    loyer:state.loyer
+  });
+}
 function reportData(){
+  refreshCalcFromDb();
   const type=state.reportType==="cumulativeToCurrent"
     ? CalcPlatform.REPORT_TYPES.CUMULATIVE
     : CalcPlatform.REPORT_TYPES.CURRENT_MONTH;
@@ -984,7 +1004,7 @@ function rapportPage(){
       <button class="btn secondary" onclick="downloadSqliteFile()">⬇ ${DB_FILE_NAME}</button>
       <button class="btn secondary" onclick="triggerImportDb()">⬆ Importer ${DB_FILE_NAME}</button>
     </div>
-    <p class="subtitle" style="margin-top:14px">Pour partager entre Chrome, Edge ou un autre appareil : exportez <b>${DB_FILE_NAME}</b>, puis importez-le sur l'autre navigateur. Avec <b>npm start</b>, le fichier <b>data/${DB_FILE_NAME}</b> est partagé automatiquement.</p>
+    <p class="subtitle" style="margin-top:14px">Tous les rapports sont générés depuis <b>data/${DB_FILE_NAME}</b> (tables clients, dépenses, rdvs, settings). Avec <b>npm start</b> ou un hébergement <b>PHP</b>, ce fichier est la base permanente — comme votre ancien projet PHP.</p>
   </div>`;
 }
 
