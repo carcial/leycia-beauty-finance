@@ -115,13 +115,16 @@ function renderLoading(msg) {
 }
 
 function renderConfigError(msg) {
+  const pagesHint =
+    location.hostname.endsWith("github.io")
+      ? `<br><br><b>GitHub Pages :</b> ouvrez l'URL avec le nom du dépôt, ex. <code>https://votre-user.github.io/leycia-beauty-finance/</code> (slash final). Vérifiez que <code>config.js</code> est bien poussé sur <code>master</code>.`
+      : `<br><br><b>En local :</b> <code>cp .env.example .env</code> puis <code>node setup.mjs</code>.`;
   document.getElementById("root").innerHTML = `
     <div class="loading-screen">
       <div style="color:var(--danger);font-weight:800;margin-bottom:10px">Configuration Supabase manquante</div>
-      <div style="font-size:13px;font-weight:500;max-width:480px;text-align:center;line-height:1.55">
+      <div style="font-size:13px;font-weight:500;max-width:520px;text-align:center;line-height:1.55">
         ${escapeHTML(msg)}
-        <br><br><b>En local :</b> copiez <code>.env.example</code> → <code>.env</code>, puis <code>node setup.mjs</code>.
-        <br><br><b>Sur GitHub Pages :</b> ajoutez les secrets <code>SUPABASE_URL</code> et <code>SUPABASE_ANON_KEY</code> dans le dépôt (Settings → Secrets → Actions), activez Pages avec la source <b>GitHub Actions</b>, puis poussez sur <code>master</code>.
+        ${pagesHint}
       </div>
     </div>`;
 }
