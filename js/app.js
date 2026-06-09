@@ -120,7 +120,8 @@ function renderConfigError(msg) {
       <div style="color:var(--danger);font-weight:800;margin-bottom:10px">Configuration Supabase manquante</div>
       <div style="font-size:13px;font-weight:500;max-width:480px;text-align:center;line-height:1.55">
         ${escapeHTML(msg)}
-        <br><br>Copiez <code>.env.example</code> vers <code>.env</code>, renseignez vos clés, puis exécutez <code>node setup.mjs</code>.
+        <br><br><b>En local :</b> copiez <code>.env.example</code> → <code>.env</code>, puis <code>node setup.mjs</code>.
+        <br><br><b>Sur GitHub Pages :</b> ajoutez les secrets <code>SUPABASE_URL</code> et <code>SUPABASE_ANON_KEY</code> dans le dépôt (Settings → Secrets → Actions), activez Pages avec la source <b>GitHub Actions</b>, puis poussez sur <code>master</code>.
       </div>
     </div>`;
 }
