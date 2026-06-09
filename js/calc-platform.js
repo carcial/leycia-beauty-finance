@@ -1,8 +1,5 @@
 /**
- * CalcPlatform — moteur centralisé de calculs MonSalon
- *
- * Tous les gains, dépenses, loyers et agrégations RDV passent par ici.
- * Modifier le loyer ou les données appelle sync() : toute l'interface se recalcule.
+ * CalcPlatform — calculs MonSalon (côté frontend uniquement)
  */
 const CalcPlatform = (() => {
   const LOYER_DEFAUT = 250;
@@ -10,41 +7,55 @@ const CalcPlatform = (() => {
   const RDV_STATUS = {
     PENDING: "pending",
     COMPLETED: "completed",
-    DELETED: "deleted",
+    DELETED: "deleted"
   };
 
   const REPORT_TYPES = {
     CURRENT_MONTH: "currentMonth",
-    CUMULATIVE: "cumulativeToCurrent",
+    CUMULATIVE: "cumulativeToCurrent"
   };
 
   let data = {
-    clients: [],
+    revenus: [],
     depenses: [],
     rdvs: [],
-    loyer: LOYER_DEFAUT,
+    loyer: LOYER_DEFAUT
   };
 
   let version = 0;
   let snapshot = null;
 
-  /* ── Utilitaires ── */
+  function revNom(r) {
+    return (r && r.client_nom_snapshot) || "";
+  }
+  function revTel(r) {
+    return (r && r.telephone_snapshot) || "";
+  }
+  function revGenre(r) {
+    return (r && r.genre_snapshot) || "";
+  }
+  function rdvNom(r) {
+    return (r && r.client_nom_snapshot) || "";
+  }
+  function rdvTel(r) {
+    return (r && r.telephone_snapshot) || "";
+  }
+  function rdvGenre(r) {
+    return (r && r.genre_snapshot) || "";
+  }
+
   function parseMoney(v) {
     return parseFloat(String(v || "").replace(",", ".").replace(/[^0-9.]/g, "")) || 0;
   }
-
   function monthKey(d) {
     return (d || "").slice(0, 7);
   }
-
   function today() {
     return new Date().toISOString().slice(0, 10);
   }
-
   function sumMontant(items, field = "montant") {
     return (items || []).reduce((s, x) => s + Number(x[field] || 0), 0);
   }
-
   function uniqueMonthKeys(...lists) {
     const keys = new Set();
     lists.flat().forEach((item) => {
@@ -53,8 +64,6 @@ const CalcPlatform = (() => {
     });
     return [...keys].sort();
   }
-
-  /** Tous les mois entre deux clés YYYY-MM (inclus). */
   function monthsBetween(fromKey, toKey) {
     if (!fromKey || !toKey) return [];
     const [fy, fm] = fromKey.split("-").map(Number);
@@ -72,49 +81,37 @@ const CalcPlatform = (() => {
     }
     return out;
   }
-
   function isActive(item) {
     return item && !item.deleted_at;
   }
-
-  /** Entrées visibles dans la caisse, le tableau de bord et les listes actives. */
   function filterActive(items) {
     return (items || []).filter(isActive);
   }
-
-  /** Toutes les entrées — y compris retirées — pour rapports et exports cumulés. */
   function filterArchived(items) {
     return [...(items || [])];
   }
-
   function filterByMonth(items, key) {
     return (items || []).filter((x) => monthKey(x.date) === key);
   }
-
   function filterByDate(items, date) {
     return (items || []).filter((x) => x.date === date);
   }
-
   function filterUpToMonth(items, key) {
     return (items || []).filter((x) => monthKey(x.date) <= key);
   }
-
   function getLoyer() {
     const v = Number(data.loyer);
     return v > 0 ? v : LOYER_DEFAUT;
   }
-
   function profit(revenus, depenses, rentMonthCount = 1) {
     return revenus - depenses - getLoyer() * rentMonthCount;
   }
 
-  /* ── RDV : cycle de vie & regroupement ── */
   function rdvRank(status) {
     if (status === RDV_STATUS.PENDING) return 0;
     if (status === RDV_STATUS.COMPLETED) return 1;
     return 2;
   }
-
   function sortRdvs(rdvs) {
     return [...(rdvs || [])].sort((a, b) => {
       const dr = rdvRank(a.status) - rdvRank(b.status);
@@ -122,62 +119,42 @@ const CalcPlatform = (() => {
       return `${a.date}T${a.heure || ""}`.localeCompare(`${b.date}T${b.heure || ""}`);
     });
   }
-
+  function isRdvActive(r) {
+    return r && !r.deleted_at;
+  }
+  function activeRdvs(rdvs = data.rdvs) {
+    return (rdvs || []).filter(isRdvActive);
+  }
   function rdvsPending(rdvs = data.rdvs) {
-    return (rdvs || []).filter((r) => r.status === RDV_STATUS.PENDING);
+    return activeRdvs(rdvs).filter((r) => r.status === RDV_STATUS.PENDING);
   }
-
   function rdvsForDate(date, rdvs = data.rdvs) {
-    return sortRdvs(filterByDate(rdvs, date));
+    return sortRdvs(filterByDate(activeRdvs(rdvs), date));
   }
 
-  /** Téléphone du RDV, ou retrouvé via encaissement / historique client / autre RDV. */
-  function findClientPhone(rdv, clients = data.clients, rdvs = data.rdvs) {
+  function findClientPhone(rdv, revenus = data.revenus) {
     if (!rdv) return "";
-    const fromRdv = (rdv.telephone || "").trim();
+    const fromRdv = rdvTel(rdv).trim();
     if (fromRdv) return fromRdv;
-
-    const linked = matchRdvToClient(rdv, clients);
-    const fromLinked = (linked?.telephone || "").trim();
+    const linked = matchRdvToRevenu(rdv, revenus);
+    const fromLinked = revTel(linked).trim();
     if (fromLinked) return fromLinked;
-
-    const name = (rdv.client || "").trim().toLowerCase();
-    if (!name) return "";
-
-    const clientHit = [...clients]
-      .sort((a, b) => Number(b.id) - Number(a.id))
-      .find((c) => (c.client || "").trim().toLowerCase() === name && (c.telephone || "").trim());
-    if (clientHit) return clientHit.telephone.trim();
-
-    const rdvHit = [...rdvs]
-      .sort((a, b) => Number(b.id) - Number(a.id))
-      .find(
-        (r) =>
-          Number(r.id) !== Number(rdv.id) &&
-          (r.client || "").trim().toLowerCase() === name &&
-          (r.telephone || "").trim()
-      );
-    return rdvHit ? rdvHit.telephone.trim() : "";
+    return "";
   }
 
-  /** Lie un RDV encaissé à son entrée client (via rdv_id ou correspondance date/client/montant). */
-  function matchRdvToClient(rdv, clients = data.clients) {
+  function matchRdvToRevenu(rdv, revenus = data.revenus) {
     if (!rdv) return null;
-    const byId = clients.find((c) => Number(c.rdv_id) === Number(rdv.id));
+    const byId = revenus.find((r) => r.rdv_id && String(r.rdv_id) === String(rdv.id) && isActive(r));
     if (byId) return byId;
-    const linked = clients.filter(
-      (c) =>
-        c.date === rdv.date &&
-        c.client === rdv.client &&
-        Number(c.montant) === Number(rdv.montant)
+    const linked = revenus.filter(
+      (r) =>
+        r.date === rdv.date &&
+        revNom(r) === rdvNom(rdv) &&
+        Number(r.montant) === Number(rdv.montant)
     );
     if (linked.length === 1) return linked[0];
     if (Number(rdv.encaisse)) {
-      return (
-        linked.find((c) => (c.note || "").includes("Rendez-vous")) ||
-        linked[0] ||
-        null
-      );
+      return linked.find((r) => (r.note || "").includes("Rendez-vous")) || linked[0] || null;
     }
     return null;
   }
@@ -191,49 +168,20 @@ const CalcPlatform = (() => {
     }
     return { label: "Prévu", pill: "pill-blue" };
   }
-
-  function canTerminer(r) {
-    return r && r.status === RDV_STATUS.PENDING;
+  function canCompleteAndCash(r) {
+    return isRdvActive(r) && r.status === RDV_STATUS.PENDING && !Number(r.encaisse);
   }
-
-  function canEncaisser(r) {
-    return r && r.status === RDV_STATUS.COMPLETED && !Number(r.encaisse);
+  function canCancelRdv(r) {
+    return isRdvActive(r) && r.status === RDV_STATUS.PENDING;
   }
-
-  function canAnnuler(r) {
-    return r && r.status === RDV_STATUS.PENDING;
-  }
-
-  function canDismissCompleted(r) {
-    return r && r.status === RDV_STATUS.COMPLETED;
-  }
-
-  /** @deprecated — utiliser canAnnuler / canDismissCompleted */
-  function canSupprimer(r) {
-    return canAnnuler(r);
-  }
-
-  function daysUntilPurge(completedAt, purgeDays = 2) {
-    if (!completedAt) return purgeDays;
-    const end = new Date(completedAt);
-    end.setDate(end.getDate() + purgeDays);
-    const diff = Math.ceil((end - new Date()) / 86400000);
-    return Math.max(0, diff);
-  }
-
-  /** Actions autorisées selon l'état du RDV — source unique pour les boutons UI. */
   function rdvActions(r) {
     return {
-      terminer: canTerminer(r),
-      encaisser: canEncaisser(r),
-      annuler: canAnnuler(r),
-      dismiss: canDismissCompleted(r),
-      supprimer: canAnnuler(r),
-      encaisse: Boolean(Number(r?.encaisse)),
+      completeAndCash: canCompleteAndCash(r),
+      cancel: canCancelRdv(r),
+      encaisse: Boolean(Number(r?.encaisse))
     };
   }
 
-  /** Groupe les RDV par date (agenda / calendrier). */
   function groupRdvsByDate(rdvs = data.rdvs) {
     const groups = {};
     sortRdvs(rdvs).forEach((r) => {
@@ -245,7 +193,7 @@ const CalcPlatform = (() => {
           completed: 0,
           deleted: 0,
           estimatedRevenue: 0,
-          encaissedRevenue: 0,
+          encaissedRevenue: 0
         };
       }
       const g = groups[r.date];
@@ -264,14 +212,13 @@ const CalcPlatform = (() => {
     return groups;
   }
 
-  /** Sous-groupes par client sur une même journée. */
   function groupRdvsByClientOnDate(date, rdvs = data.rdvs) {
     const dayRdvs = rdvsForDate(date, rdvs);
     const byClient = {};
     dayRdvs.forEach((r) => {
-      const key = (r.client || "").trim().toLowerCase() || "__sans_nom__";
+      const key = rdvNom(r).trim().toLowerCase() || "__sans_nom__";
       if (!byClient[key]) {
-        byClient[key] = { client: r.client, rdvs: [], totalMontant: 0 };
+        byClient[key] = { client: rdvNom(r), rdvs: [], totalMontant: 0 };
       }
       byClient[key].rdvs.push(r);
       byClient[key].totalMontant += Number(r.montant || 0);
@@ -279,12 +226,10 @@ const CalcPlatform = (() => {
     return Object.values(byClient);
   }
 
-  /** Vue journée : revenus encaissés + RDV + correspondances automatiques. */
   function dayActivity(date) {
-    const clients = filterByDate(filterActive(data.clients), date);
+    const revenus = filterByDate(filterActive(data.revenus), date);
     const rdvs = rdvsForDate(date);
-    const encaissed = sumMontant(clients);
-    const groups = groupRdvsByClientOnDate(date);
+    const encaissed = sumMontant(revenus);
     const rdvGroups = groupRdvsByDate(rdvs)[date] || {
       date,
       rdvs: [],
@@ -292,148 +237,121 @@ const CalcPlatform = (() => {
       completed: 0,
       deleted: 0,
       estimatedRevenue: 0,
-      encaissedRevenue: 0,
+      encaissedRevenue: 0
     };
-
     const enrichedRdvs = rdvs.map((r) => ({
       rdv: r,
       actions: rdvActions(r),
       status: rdvStatusLabel(r),
-      linkedClient: matchRdvToClient(r),
+      linkedRevenu: matchRdvToRevenu(r)
     }));
-
     return {
       date,
-      clients,
+      revenus,
       rdvs: enrichedRdvs,
-      clientGroups: groups,
       rdvGroup: rdvGroups,
       encaissedRevenue: encaissed,
       pendingRevenue: rdvGroups.estimatedRevenue,
       totalRdvs: rdvs.length,
-      totalClients: clients.length,
+      totalRevenus: revenus.length
     };
   }
 
-  /** Indicateurs calendrier pour une cellule. */
   function calendarDaySummary(date) {
-    const dayClients = filterByDate(filterActive(data.clients), date);
-    const dayRdvs = filterByDate(data.rdvs, date);
-    const encaissed = sumMontant(dayClients);
+    const dayRevenus = filterByDate(filterActive(data.revenus), date);
+    const dayRdvs = filterByDate(activeRdvs(data.rdvs), date);
+    const encaissed = sumMontant(dayRevenus);
     const pending = dayRdvs.filter((r) => r.status === RDV_STATUS.PENDING);
     const completed = dayRdvs.some((r) => r.status === RDV_STATUS.COMPLETED);
-    const deleted = dayRdvs.some((r) => r.status === RDV_STATUS.DELETED);
     return {
       date,
       encaissedRevenue: encaissed,
       hasPending: pending.length > 0,
       pendingCount: pending.length,
       hasCompleted: completed,
-      hasDeleted: deleted,
+      hasDeleted: false
     };
   }
 
-  /* ── Calculs financiers par période ── */
   function statsForMonth(key) {
-    const clients = filterByMonth(filterActive(data.clients), key);
+    const revenus = filterByMonth(filterActive(data.revenus), key);
     const depenses = filterByMonth(filterActive(data.depenses), key);
-    const revenus = sumMontant(clients);
+    const revTotal = sumMontant(revenus);
     const depensesTotal = sumMontant(depenses);
-    const loyer = getLoyer();
-    const benefice = profit(revenus, depensesTotal, 1);
+    const benefice = profit(revTotal, depensesTotal, 1);
     const rdvsMonth = filterByMonth(data.rdvs, key);
-    const pendingRdvs = rdvsMonth.filter((r) => r.status === RDV_STATUS.PENDING);
-    const pipelineRevenue = sumMontant(pendingRdvs);
-
+    const pending = rdvsMonth.filter((r) => r.status === RDV_STATUS.PENDING && isRdvActive(r));
     return {
       monthKey: key,
-      revenus,
+      revenus: revTotal,
       depenses: depensesTotal,
-      loyer,
+      loyer: getLoyer(),
       benefice,
-      volumeClients: clients.length,
-      rdvPending: pendingRdvs.length,
-      pipelineRevenue,
-    };
-  }
-
-  function statsForDay(date) {
-    const activity = dayActivity(date);
-    return {
-      date,
-      revenus: activity.encaissedRevenue,
-      rdvCount: activity.totalRdvs,
-      clientCount: activity.totalClients,
-      pendingRevenue: activity.pendingRevenue,
+      volumeRevenus: revenus.length,
+      rdvPending: pending.length,
+      pipelineRevenue: sumMontant(pending)
     };
   }
 
   function allActivityMonthKeys({ archived = false } = {}) {
-    const clients = archived ? filterArchived(data.clients) : filterActive(data.clients);
+    const revenus = archived ? filterArchived(data.revenus) : filterActive(data.revenus);
     const depenses = archived ? filterArchived(data.depenses) : filterActive(data.depenses);
-    return uniqueMonthKeys(clients, depenses);
+    return uniqueMonthKeys(revenus, depenses);
   }
 
   function cumulativeMonthKeys(upToKey = monthKey(today()), { archived = false } = {}) {
     const activityKeys = allActivityMonthKeys({ archived }).filter((k) => k <= upToKey);
     if (!activityKeys.length) return [];
-    const first = activityKeys[0];
-    return monthsBetween(first, upToKey);
+    return monthsBetween(activityKeys[0], upToKey);
   }
 
-  /**
-   * Rapport : historique complet (entrées actives + retirées de la caisse).
-   * Le tableau de bord n'affiche que les entrées actives du mois en cours.
-   */
   function statsForReport(type = REPORT_TYPES.CURRENT_MONTH) {
     const nowKey = monthKey(today());
     let title = "Mois actuel";
-    let clients = filterArchived(data.clients);
+    let revenus = filterArchived(data.revenus);
     let depenses = filterArchived(data.depenses);
     let monthKeys = [];
     let rentMonths = 1;
 
     if (type === REPORT_TYPES.CURRENT_MONTH) {
       title = `Mois actuel — ${nowKey}`;
-      clients = filterByMonth(clients, nowKey);
+      revenus = filterByMonth(revenus, nowKey);
       depenses = filterByMonth(depenses, nowKey);
       monthKeys = [nowKey];
-      rentMonths = 1;
     } else {
       title = `Cumul jusqu'au mois présent — ${nowKey}`;
-      clients = filterUpToMonth(clients, nowKey);
+      revenus = filterUpToMonth(revenus, nowKey);
       depenses = filterUpToMonth(depenses, nowKey);
       monthKeys = cumulativeMonthKeys(nowKey, { archived: true });
       rentMonths = monthKeys.length || 1;
     }
 
-    const totalRev = sumMontant(clients);
+    const totalRev = sumMontant(revenus);
     const totalDep = sumMontant(depenses);
     const totalRent = getLoyer() * rentMonths;
     const totalProfit = totalRev - totalDep - totalRent;
-
-    const archivedClients = filterArchived(data.clients);
-    const archivedDepenses = filterArchived(data.depenses);
+    const allRevenus = filterArchived(data.revenus);
+    const allDepenses = filterArchived(data.depenses);
     const monthlyBreakdown = monthKeys.map((key) => {
-      const cs = filterByMonth(archivedClients, key);
-      const ds = filterByMonth(archivedDepenses, key);
-      const rev = sumMontant(cs);
+      const rs = filterByMonth(allRevenus, key);
+      const ds = filterByMonth(allDepenses, key);
+      const rev = sumMontant(rs);
       const dep = sumMontant(ds);
       return {
         monthKey: key,
-        clients: cs,
+        revenus: rs,
         depenses: ds,
-        revenus: rev,
+        revenusTotal: rev,
         depensesTotal: dep,
         loyer: getLoyer(),
-        benefice: profit(rev, dep, 1),
+        benefice: profit(rev, dep, 1)
       };
     });
 
     return {
       type,
       title,
-      clients,
+      revenus,
       depenses,
       monthKeys,
       rentMonths,
@@ -442,22 +360,18 @@ const CalcPlatform = (() => {
       totalDep,
       totalRent,
       totalProfit,
-      monthlyBreakdown,
+      monthlyBreakdown
     };
   }
 
-  /** Recalcule l'instantané global — appelé après chaque sync(). */
   function rebuildSnapshot() {
     const nowKey = monthKey(today());
     snapshot = {
       version,
       loyer: getLoyer(),
       currentMonth: statsForMonth(nowKey),
-      reportCurrent: statsForReport(REPORT_TYPES.CURRENT_MONTH),
-      reportCumulative: statsForReport(REPORT_TYPES.CUMULATIVE),
       pendingRdvs: sortRdvs(rdvsPending()),
-      rdvGroupsByDate: groupRdvsByDate(),
-      activityMonthKeys: allActivityMonthKeys(),
+      rdvGroupsByDate: groupRdvsByDate()
     };
     return snapshot;
   }
@@ -467,12 +381,8 @@ const CalcPlatform = (() => {
     return snapshot;
   }
 
-  /**
-   * Synchronise les données depuis la base.
-   * Toute modification (loyer, client, dépense, RDV) doit passer par sync().
-   */
-  function sync({ clients, depenses, rdvs, loyer } = {}) {
-    if (clients !== undefined) data.clients = clients;
+  function sync({ revenus, depenses, rdvs, loyer } = {}) {
+    if (revenus !== undefined) data.revenus = revenus;
     if (depenses !== undefined) data.depenses = depenses;
     if (rdvs !== undefined) data.rdvs = rdvs;
     if (loyer !== undefined) data.loyer = parseMoney(loyer) || LOYER_DEFAUT;
@@ -497,17 +407,13 @@ const CalcPlatform = (() => {
     setLoyer,
     getLoyer,
     getSnapshot,
-    rebuildSnapshot,
     parseMoney,
     monthKey,
     today,
     sumMontant,
     profit,
     statsForMonth,
-    statsForDay,
     statsForReport,
-    allActivityMonthKeys,
-    cumulativeMonthKeys,
     isActive,
     filterActive,
     filterArchived,
@@ -518,18 +424,21 @@ const CalcPlatform = (() => {
     rdvsForDate,
     rdvStatusLabel,
     rdvActions,
-    canTerminer,
-    canEncaisser,
-    canAnnuler,
-    canDismissCompleted,
-    canSupprimer,
-    daysUntilPurge,
-    matchRdvToClient,
+    canCompleteAndCash,
+    canCancelRdv,
+    activeRdvs,
+    isRdvActive,
+    matchRdvToRevenu,
     findClientPhone,
     groupRdvsByDate,
-    groupRdvsByClientOnDate,
     dayActivity,
     calendarDaySummary,
+    revNom,
+    revTel,
+    revGenre,
+    rdvNom,
+    rdvTel,
+    rdvGenre
   };
 })();
 

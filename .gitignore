@@ -1,2 +1,17 @@
+# Dépendances (plus utilisées — conservé par sécurité)
 node_modules/
-data/monsalon.db
+package-lock.json
+
+# Secrets Supabase — jamais sur GitHub
+.env
+config.js
+
+# Anciennes données locales
+data/
+*.db
+
+# Système
+.DS_Store
+Thumbs.db
+
+supabase/schema.sql

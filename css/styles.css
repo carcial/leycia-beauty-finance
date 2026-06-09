@@ -92,17 +92,7 @@ button:active{transform:scale(.98)}
 
 .badge{margin-left:auto;background:var(--gold);color:#111827;font-size:11px;font-weight:800;padding:2px 7px;border-radius:999px}
 
-.sidebar-db{background:rgba(255,255,255,.1);padding:12px;border-radius:10px;color:#FFFFFF;font-size:12px;border:1px solid rgba(255,255,255,.14);margin-bottom:12px}
-
-.sidebar-db-title{font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:1px;opacity:.9;margin-bottom:8px}
-
-.sidebar-db-actions{display:flex;gap:8px;margin-bottom:8px}
-
-.sidebar-db-actions .btn{width:100%;min-height:34px;padding:7px 10px;font-size:12px}
-
 .sidebar-footer{background:rgba(255,255,255,.12);padding:13px;border-radius:10px;color:#FFFFFF;font-size:12px;text-align:center;line-height:1.5;border:1px solid rgba(255,255,255,.15)}
-
-.sidebar-note{opacity:.85;font-size:11px;margin-top:6px;display:block;line-height:1.45}
 
 
 
